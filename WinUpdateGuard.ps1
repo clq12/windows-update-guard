@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:AppName = 'Windows 更新卫士'
-$script:Version = '1.0'
+$script:Version = '1.0.1'
 $script:Root = Join-Path $env:ProgramData 'WinUpdateGuard'
 $script:SnapDir = Join-Path $script:Root 'snapshots'
 $script:LogDir = Join-Path $script:Root 'logs'
@@ -305,11 +305,26 @@ function Test-GuardTask {
     catch { return $false }
 }
 
+function Sync-GuardScript {
+    # 始终用当前脚本覆盖 ProgramData 下的副本，保证版本升级后看护任务跑的是新版
+    $dst = Join-Path $script:Root 'WinUpdateGuard.ps1'
+    try {
+        $src = [System.IO.Path]::GetFullPath($script:SelfPath)
+        $full = [System.IO.Path]::GetFullPath($dst)
+        if ($src -ne $full -and (Test-Path -LiteralPath $src)) {
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+        }
+        return $true
+    }
+    catch {
+        Write-Log ('更新看护脚本副本失败: ' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
 function New-GuardTask {
     $dst = Join-Path $script:Root 'WinUpdateGuard.ps1'
-    if (-not (Test-Path -LiteralPath $dst)) {
-        Copy-Item -LiteralPath $script:SelfPath -Destination $dst -Force
-    }
+    Sync-GuardScript | Out-Null
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Enforce' -f $dst
     $action = New-ScheduledTaskAction -Execute $ps -Argument $arg
@@ -528,19 +543,32 @@ function Invoke-ApplyMode {
     # 4) 彻底：服务 + 防火墙 + 看护任务
     if ($applyMode -eq 'Strict') {
         foreach ($s in $script:SvcNames) {
-            if (Set-SvcStart $s 4) {
+            if ((Get-SvcState $s).Start -eq 4) {
+                $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+                if ($null -ne $svc -and $svc.Status -ne 'Stopped') { Stop-UpdSvc $s | Out-Null }
+                Write-Log ('服务 {0} 已处于禁用状态' -f $s)
+            }
+            elseif (Set-SvcStart $s 4) {
                 Stop-UpdSvc $s | Out-Null
                 Write-Log ('服务 {0} 已设为禁用并尝试停止' -f $s)
             }
             else { Write-Log ('服务 {0} 启动类型修改失败（可能被安全软件拦截）' -f $s) 'WARN' }
         }
         foreach ($s in $script:SvcNames) {
-            if (Add-FwBlock $s) { Write-Log ('已添加出站阻断规则: ' + $s) }
+            if (Test-FwRule $s) { Write-Log ('出站阻断规则已存在: ' + $s) }
+            elseif (Add-FwBlock $s) { Write-Log ('已添加出站阻断规则: ' + $s) }
             else { Write-Log ('防火墙规则添加失败: ' + $s) 'WARN' }
         }
-        $ok = New-GuardTask
-        if ($ok) { Protect-RootDir; Write-Log '已注册 SYSTEM 看护任务（开机/登录/每 30 分钟）' }
-        else { Write-Log '看护任务注册失败，其余设置已生效' 'WARN' }
+        Protect-RootDir
+        if (Test-GuardTask) {
+            Sync-GuardScript | Out-Null
+            Write-Log '看护任务已存在，跳过重建（避免重置触发器）'
+        }
+        else {
+            $ok = New-GuardTask
+            if ($ok) { Write-Log '已注册 SYSTEM 看护任务（开机/登录/每 30 分钟）' }
+            else { Write-Log '看护任务注册失败，其余设置已生效' 'WARN' }
+        }
     }
     else {
         # 降级应用：如果之前是 Strict，清掉服务和防火墙层

@@ -75,6 +75,53 @@
 
 ---
 
+## 「SYSTEM 看护任务」到底在干什么
+
+彻底档会注册一个计划任务，这是本工具唯一**长期驻留**的东西，单独说明：
+
+| 项 | 值 |
+|---|---|
+| 任务名 | `WinUpdateGuard Keep`（任务计划程序根目录） |
+| 运行身份 | `SYSTEM`（`S-1-5-18`），最高权限 |
+| 触发器 | 开机时、任意用户登录时、每 30 分钟一次 |
+| 执行内容 | `powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\WinUpdateGuard\WinUpdateGuard.ps1" -Enforce` |
+| 超时 / 电源 | 10 分钟；电池供电也运行，切到电池不中止 |
+| 界面 | 完全隐藏，无窗口、无托盘图标 |
+
+每次触发只做一件事：**读快照里记录的模式，把当前档位重新刷一遍**。
+
+1. 刷新「暂停更新」的到期时间（保持在 N 天之后，不会自己过期）
+2. 检查并写回 `NoAutoUpdate` / `NoAutoRebootWithLoggedOnUsers` / `ExcludeWUDriversInQualityUpdate`
+3. 若 `wuauserv`、`UsoSvc` 被系统改回自动，重新设为禁用并停止（已经是禁用就跳过）
+4. 若两条出站阻断规则被删，补回去（已存在则跳过，不重建）
+5. 若任务自身被删，重建（已存在则跳过，不重置触发器）
+
+**它不做什么**：不联网、不下载、不收集任何信息、不常驻进程、不碰系统自带的更新任务。
+
+### 为什么需要它
+
+Windows 有三套自愈机制会把设置改回去：`WaaSMedicSvc`（更新医生服务）、`UpdateOrchestrator` 下的计划任务、以及系统大版本升级时的策略重置。尤其"禁用服务"这一手，很容易被 `WaaSMedicSvc` 在下次扫描时修回来。看护任务就是用来抵消这个"被改回去"的动作。
+
+### 怎么确认它在跑
+
+```powershell
+# 上次/下次运行时间、上次结果（0 = 成功）
+Get-ScheduledTask -TaskName "WinUpdateGuard Keep" | Get-ScheduledTaskInfo
+
+# 看它每次具体做了什么
+Get-Content "C:\ProgramData\WinUpdateGuard\logs\guard-$(Get-Date -f yyyyMMdd).log"
+```
+
+### 怎么停掉它
+
+- 界面点「完全恢复」（会一并删任务、删防火墙规则、按快照还原策略），或
+- `.\WinUpdateGuard.ps1 -Restore -Yes`，或
+- 手动：`Unregister-ScheduledTask -TaskName "WinUpdateGuard Keep" -Confirm:$false`
+
+> 看护任务依赖 `C:\ProgramData\WinUpdateGuard\` 下的脚本副本和快照，该目录被 `icacls` 收紧到只有 SYSTEM 和 Administrators 可写。**删掉整个目录，任务会空转（什么都不做），但任务本身还在**，需要按上面的方法删任务。
+
+---
+
 ## 快照与回滚
 
 首次应用时会在 `C:\ProgramData\WinUpdateGuard\snapshots\` 生成一份 `.ini` 快照：
