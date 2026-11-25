@@ -25,7 +25,11 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:AppName = 'Windows 更新卫士'
-$script:Version = '1.0.1'
+$script:Version = '1.0.2'
+# 看护任务重复间隔（分钟）。360 = 6 小时；想要每天一次改成 1440。
+$script:GuardIntervalMinutes = 360
+# 看护触发时，暂停剩余天数高于这个值就跳过刷新（减少无谓写入）
+$script:PauseRefreshDays = 7
 $script:Root = Join-Path $env:ProgramData 'WinUpdateGuard'
 $script:SnapDir = Join-Path $script:Root 'snapshots'
 $script:LogDir = Join-Path $script:Root 'logs'
@@ -322,20 +326,35 @@ function Sync-GuardScript {
     }
 }
 
+function New-GuardTriggers {
+    return @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -AtLogOn),
+        (New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) -RepetitionInterval (New-TimeSpan -Minutes $script:GuardIntervalMinutes))
+    )
+}
+
+function Update-GuardTaskTriggers {
+    # 只更新触发器定义，不删除任务、不丢历史
+    try {
+        Set-ScheduledTask -TaskName $script:TaskName -Trigger (New-GuardTriggers) | Out-Null
+        return $true
+    }
+    catch {
+        Write-Log ('更新看护触发器失败: ' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
 function New-GuardTask {
     $dst = Join-Path $script:Root 'WinUpdateGuard.ps1'
     Sync-GuardScript | Out-Null
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Enforce' -f $dst
     $action = New-ScheduledTaskAction -Execute $ps -Argument $arg
-    $triggers = @(
-        (New-ScheduledTaskTrigger -AtStartup),
-        (New-ScheduledTaskTrigger -AtLogOn),
-        (New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) -RepetitionInterval (New-TimeSpan -Minutes 30))
-    )
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger (New-GuardTriggers) -Principal $principal -Settings $settings -Force | Out-Null
     return (Test-GuardTask)
 }
 
@@ -359,7 +378,7 @@ function Protect-RootDir {
 
 # ---------------------------------------------------------------- 快照
 function New-BaselineSnapshot {
-    param([string]$ModeName)
+    param([string]$ModeName, [int]$PauseDays = 35, [switch]$NoLatest)
     Ensure-Dirs
     $reg = @()
     foreach ($item in $script:ManagedReg) { $reg += (Get-RegState $item) }
@@ -371,6 +390,7 @@ function New-BaselineSnapshot {
     $snap = [pscustomobject]@{
         Created     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         Mode        = $ModeName
+        PauseDays   = $PauseDays
         Os          = (Get-CimInstance Win32_OperatingSystem).Caption
         TaskExisted = (Test-GuardTask)
         Reg         = $reg
@@ -380,7 +400,9 @@ function New-BaselineSnapshot {
     $name = 'snapshot-{0}.ini' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
     $file = Join-Path $script:SnapDir $name
     Save-Snapshot $snap $file
-    Copy-Item -LiteralPath $file -Destination $script:Latest -Force
+    if (-not $NoLatest) {
+        Copy-Item -LiteralPath $file -Destination $script:Latest -Force
+    }
     $snap.Path = $file
     return $snap
 }
@@ -392,6 +414,7 @@ function Save-Snapshot {
     [void]$sb.AppendLine('[meta]')
     [void]$sb.AppendLine('created=' + $Snap.Created)
     [void]$sb.AppendLine('mode=' + $Snap.Mode)
+    [void]$sb.AppendLine('pause=' + $Snap.PauseDays)
     [void]$sb.AppendLine('os=' + $Snap.Os)
     [void]$sb.AppendLine('taskexisted=' + [int][bool]$Snap.TaskExisted)
     [void]$sb.AppendLine('[reg]')
@@ -415,6 +438,7 @@ function Load-Snapshot {
     $snap = [pscustomobject]@{
         Created     = ''
         Mode        = ''
+        PauseDays   = 35
         Os          = ''
         TaskExisted = $false
         Reg         = @()
@@ -435,6 +459,10 @@ function Load-Snapshot {
             switch ($kv[0]) {
                 'created' { $snap.Created = $kv[1] }
                 'mode' { $snap.Mode = $kv[1] }
+                'pause' {
+                    $n = 35
+                    if ([int]::TryParse($kv[1], [ref]$n)) { $snap.PauseDays = $n }
+                }
                 'os' { $snap.Os = $kv[1] }
                 'taskexisted' { $snap.TaskExisted = ($kv[1] -eq '1') }
             }
@@ -491,7 +519,8 @@ function Invoke-ApplyMode {
         [bool]$DeferFeature = $true,
         [int]$Pause = 35,
         [int]$Defer = 365,
-        [switch]$Silent
+        [switch]$Silent,
+        [switch]$Quiet
     )
     if (-not (Test-Admin)) { throw '需要管理员权限' }
     Ensure-Dirs
@@ -500,7 +529,7 @@ function Invoke-ApplyMode {
     $snap = Get-LatestSnapshot
     if ($null -ne $snap -and $snap.Mode -eq 'Selftest') { $snap = $null }
     if ($null -eq $snap) {
-        $snap = New-BaselineSnapshot -ModeName $applyMode
+        $snap = New-BaselineSnapshot -ModeName $applyMode -PauseDays $Pause
         Write-Log ('已创建原状快照: {0}' -f $snap.Path) 'SNAP'
     }
     else {
@@ -508,16 +537,33 @@ function Invoke-ApplyMode {
     }
 
     # 1) 暂停更新（官方机制，设置页可见）
-    $now = (Get-Date).ToUniversalTime()
-    $startStr = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $endStr = $now.AddDays($Pause).ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Set-RegValue $script:KUX 'PauseFeatureUpdatesStartTime' $startStr 'String'
-    Set-RegValue $script:KUX 'PauseFeatureUpdatesEndTime' $endStr 'String'
-    Set-RegValue $script:KUX 'PauseQualityUpdatesStartTime' $startStr 'String'
-    Set-RegValue $script:KUX 'PauseQualityUpdatesEndTime' $endStr 'String'
-    Set-RegValue $script:KUX 'PauseUpdatesStartTime' $startStr 'String'
-    Set-RegValue $script:KUX 'PauseUpdatesExpiryTime' $endStr 'String'
-    Write-Log ('已设置暂停更新 {0} 天，至 {1}' -f $Pause, $endStr)
+    $refreshPause = $true
+    $leftDays = 0
+    if ($Quiet) {
+        $cur = Get-RegValue $script:KUX 'PauseUpdatesExpiryTime'
+        if ($cur) {
+            try {
+                $leftDays = ([datetime]::Parse([string]$cur) - (Get-Date)).TotalDays
+                if ($leftDays -gt $script:PauseRefreshDays) { $refreshPause = $false }
+            }
+            catch { }
+        }
+    }
+    if ($refreshPause) {
+        $now = (Get-Date).ToUniversalTime()
+        $startStr = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $endStr = $now.AddDays($Pause).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Set-RegValue $script:KUX 'PauseFeatureUpdatesStartTime' $startStr 'String'
+        Set-RegValue $script:KUX 'PauseFeatureUpdatesEndTime' $endStr 'String'
+        Set-RegValue $script:KUX 'PauseQualityUpdatesStartTime' $startStr 'String'
+        Set-RegValue $script:KUX 'PauseQualityUpdatesEndTime' $endStr 'String'
+        Set-RegValue $script:KUX 'PauseUpdatesStartTime' $startStr 'String'
+        Set-RegValue $script:KUX 'PauseUpdatesExpiryTime' $endStr 'String'
+        Write-Log ('已设置暂停更新 {0} 天，至 {1}' -f $Pause, $endStr)
+    }
+    else {
+        Write-Log ('暂停仍在有效期内（剩余 {0:0} 天），跳过刷新' -f $leftDays)
+    }
 
     # 2) 附加选项
     if ($BlockAutoReboot) {
@@ -562,11 +608,17 @@ function Invoke-ApplyMode {
         Protect-RootDir
         if (Test-GuardTask) {
             Sync-GuardScript | Out-Null
-            Write-Log '看护任务已存在，跳过重建（避免重置触发器）'
+            if ($Quiet) {
+                Write-Log '看护任务已存在，跳过（看护模式不改任务定义）'
+            }
+            else {
+                Update-GuardTaskTriggers | Out-Null
+                Write-Log ('看护任务已存在，触发器已对齐（开机/登录/每 {0} 分钟）' -f $script:GuardIntervalMinutes)
+            }
         }
         else {
             $ok = New-GuardTask
-            if ($ok) { Write-Log '已注册 SYSTEM 看护任务（开机/登录/每 30 分钟）' }
+            if ($ok) { Write-Log ('已注册 SYSTEM 看护任务（开机/登录/每 {0} 分钟）' -f $script:GuardIntervalMinutes) }
             else { Write-Log '看护任务注册失败，其余设置已生效' 'WARN' }
         }
     }
@@ -592,8 +644,9 @@ function Invoke-ApplyMode {
         }
     }
     # 档位变化时同步到快照，保证 -Enforce 用最新档位自愈
-    if ($snap.Mode -ne $applyMode) {
+    if ($snap.Mode -ne $applyMode -or $snap.PauseDays -ne $Pause) {
         $snap.Mode = $applyMode
+        $snap.PauseDays = $Pause
         Save-Snapshot $snap $snap.Path
         if ((Split-Path -Leaf $snap.Path) -ne 'latest.ini') {
             Copy-Item -LiteralPath $snap.Path -Destination $script:Latest -Force
@@ -756,7 +809,7 @@ function Invoke-Selftest {
     Write-Host ('脚本路径: ' + $script:SelfPath)
     Write-Host ('程序目录: ' + $script:Root)
     Write-Host ('PS 版本: ' + $PSVersionTable.PSVersion)
-    $snap = New-BaselineSnapshot -ModeName 'Selftest'
+    $snap = New-BaselineSnapshot -ModeName 'Selftest' -NoLatest
     Write-Host ('快照已写入: ' + $snap.Path)
     $back = Load-Snapshot $snap.Path
     Write-Host ('回读注册表项: ' + $back.Reg.Count + ' / 服务: ' + $back.Svc.Count)
@@ -768,6 +821,8 @@ function Invoke-Selftest {
     Write-Host ('快照一致性差异: ' + $diff)
     Write-Host ('状态判断: ' + (Get-GuardState).Text)
     Write-Host ('检查项数量: ' + (Get-GuardChecks).Count)
+    # 自检快照不留在正式目录里
+    Remove-Item -LiteralPath $snap.Path -Force -ErrorAction SilentlyContinue
     Write-Host '=== 自检结束 ==='
 }
 
@@ -806,7 +861,7 @@ if ($Enforce) {
     if ($null -eq $snap) { return }
     $m = $snap.Mode
     if ($m -notin @('Lite', 'Standard', 'Strict')) { return }
-    Invoke-ApplyMode -ModeName $m -BlockAutoReboot $true -ExcludeDrivers $true -DeferFeature $true -Pause $PauseDays -Defer $DeferDays | Out-Null
+    Invoke-ApplyMode -ModeName $m -BlockAutoReboot $true -ExcludeDrivers $true -DeferFeature $true -Pause $snap.PauseDays -Defer $DeferDays -Quiet | Out-Null
     return
 }
 
@@ -918,7 +973,8 @@ function Invoke-UiNewBaseline {
     $msg += "`r`n`r`n确认重建基线？"
     if ([System.Windows.Forms.MessageBox]::Show($msg, '重建基线快照', 'YesNo', 'Warning') -ne 'Yes') { return }
     try {
-        $snap = New-BaselineSnapshot -ModeName 'Manual'
+        $opt = Get-UiOption
+        $snap = New-BaselineSnapshot -ModeName 'Manual' -PauseDays $opt.Pause
         Write-Log ('已重建基线快照: ' + $snap.Path) 'SNAP'
         [System.Windows.Forms.MessageBox]::Show(('新基线已保存：' + $snap.Path), '完成', 'OK', 'Information') | Out-Null
         Update-UiState
@@ -1075,7 +1131,7 @@ function Show-MainGui {
     $gbMode.Controls.Add($rbStrict)
 
     $lbStrict = New-Object System.Windows.Forms.Label
-    $lbStrict.Text = '禁用更新服务 + 出站阻断 + SYSTEM 看护任务（每 30 分钟自愈）。更新页面可能报错，补丁完全停更。'
+    $lbStrict.Text = '禁用更新服务 + 出站阻断 + SYSTEM 看护任务（开机/登录 + 每 6 小时自愈）。更新页面可能报错，补丁完全停更。'
     $lbStrict.ForeColor = [System.Drawing.Color]::FromArgb(160, 60, 40)
     $lbStrict.Location = New-Object System.Drawing.Point(34, 146)
     $lbStrict.Size = New-Object System.Drawing.Size(650, 20)
