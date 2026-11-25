@@ -22,6 +22,8 @@
 
 ## 快速开始
 
+**直接下载**：<https://github.com/clq12/windows-update-guard/releases/latest> （不用 clone，解压即用）
+
 1. 下载本仓库，解压到任意目录（U 盘、桌面都行）
 2. 双击 **`启动.vbs`**，在弹出的 UAC 提示里选「是」
 3. 选档位 → 点「应用所选模式」
